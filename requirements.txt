@@ -4,3 +4,4 @@ pystray
 Pillow
 pynput
 edge-tts
+pywin32
