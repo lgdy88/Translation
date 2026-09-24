@@ -46,6 +46,18 @@ def _app_dir() -> str:
 
 CONFIG_FILE = os.path.join(_app_dir(), 'translator_config.ini')
 
+LOG_FILE = os.path.join(_app_dir(), 'translator.log')
+
+
+def _log(msg):
+    """追加式运行日志：启动 / 热键 / 翻译 / 剪贴板事件，排障用。"""
+    try:
+        with open(LOG_FILE, 'a', encoding='utf-8', buffering=1) as f:
+            f.write(f'{time.strftime("%Y-%m-%d %H:%M:%S")} '
+                    f'[{threading.current_thread().name}] {msg}\n')
+    except Exception:
+        pass
+
 CLIP_DB = os.path.join(_app_dir(), 'clipboard_history.db')
 CLIP_MAX_ITEMS = 200
 CLIP_POPUP_ROWS = 30
@@ -415,6 +427,7 @@ def on_key_press(key):
         return
     if _alt_pressed and not _alt_v_fired and _is_v_key(key):
         _alt_v_fired = True
+        _log('hotkey: Alt+V 触发')
         _open_clipboard_popup()
         return
     if key in (pynkb.Key.ctrl_l, pynkb.Key.ctrl_r):
@@ -422,7 +435,7 @@ def on_key_press(key):
         _ctrl_pressed = True
         _ctrl_press_time = time.time()
         _other_key_in_ctrl = False
-    if _ctrl_pressed:
+    elif _ctrl_pressed:
         _other_key_in_ctrl = True
         return
 
@@ -448,6 +461,7 @@ def on_key_release(key):
     now = time.time()
     if now - _last_ctrl_click_t < DOUBLE_CLICK_INTERVAL:
         _last_ctrl_click_t = 0.0
+        _log('hotkey: 双击Ctrl 触发翻译')
         threading.Thread(target=translation_worker, daemon=True).start()
         return
     _last_ctrl_click_t = now
@@ -816,19 +830,30 @@ def _get_foreground_window():
 
 
 def _paste_to_window(hwnd):
-    """把焦点交还目标窗口并模拟 Ctrl+V。"""
+    """把焦点交还目标窗口并模拟 Ctrl+V。
+
+    用户可能仍按住 Alt+V 不放（物理 Alt 尚在按下状态），必须等它释放，
+    否则注入的 Ctrl+V 与残留 Alt 组合成 Alt+Ctrl+V，粘贴失败。
+    """
     global _simulating
     kb = ctypes.windll.user32.keybd_event
+    user32 = ctypes.windll.user32
     VK_CONTROL, VK_MENU, VK_V, KEYUP = 17, 18, 86, 2
     try:
-        if hwnd and ctypes.windll.user32.IsWindow(int(hwnd)):
-            ctypes.windll.user32.SetForegroundWindow(int(hwnd))
+        if hwnd and user32.IsWindow(int(hwnd)):
+            user32.SetForegroundWindow(int(hwnd))
     except Exception:
         pass
-    time.sleep(0.06)
+    # 等待物理 Alt 抬起（最多 1.5s），GetAsyncKeyState bit0x8000 = 按下
+    deadline = time.time() + 1.5
+    while time.time() < deadline:
+        if not (user32.GetAsyncKeyState(VK_MENU) & 0x8000):
+            break
+        time.sleep(0.03)
+    time.sleep(0.08)
     _simulating = True
     try:
-        kb(VK_MENU, 0, KEYUP, 0)
+        kb(VK_MENU, 0, KEYUP, 0)      # 确保逻辑 Alt 抬起
         time.sleep(0.02)
         kb(VK_CONTROL, 0, 0, 0)
         kb(VK_V, 0, 0, 0)
@@ -912,10 +937,17 @@ class ClipHistoryManager:
         popup.bind('<Escape>', lambda e: self._close())
         popup.bind('<Return>', lambda e: self._activate(True))
         popup.bind('<Shift-Return>', lambda e: self._activate(False))
+        popup.bind('<Alt-Return>', lambda e: self._activate(True))
+        popup.bind('<Control-Return>', lambda e: self._activate(True))
+        # Alt+V 按住不放弹窗时，方向键带 Alt 修饰（Alt+Up/Down）→ 一并绑定
         popup.bind('<Up>', lambda e: self._move(-1))
+        popup.bind('<Alt-Up>', lambda e: self._move(-1))
         popup.bind('<Down>', lambda e: self._move(1))
+        popup.bind('<Alt-Down>', lambda e: self._move(1))
         popup.bind('<Delete>', lambda e: self._delete_current())
+        popup.bind('<Key>', self._on_unbound_key)
         canvas.bind('<MouseWheel>', self._on_wheel)
+        canvas.bind('<Button-1>', lambda e: popup.focus_force())
 
         popup.update_idletasks()
         pw = popup.winfo_reqwidth()
@@ -933,7 +965,20 @@ class ClipHistoryManager:
 
         self.popup = popup
         self._highlight()
-        popup.focus_set()
+        # overrideredirect 窗口不会自动获得键盘焦点，必须 focus_force
+        # 且需 Windows 层面把输入焦点切过来（SetForegroundWindow）
+        try:
+            hwnd = ctypes.windll.user32.GetParent(popup.winfo_id())
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        popup.focus_force()
+
+        def _refocus():
+            if popup.winfo_exists():
+                popup.focus_force()
+        popup.after(50, _refocus)
+        popup.after(200, _refocus)
         self._watch_outside_click(popup)
 
     def _build_row(self, row):
@@ -1011,6 +1056,10 @@ class ClipHistoryManager:
         if paste and self.target_hwnd:
             _paste_to_window(self.target_hwnd)
 
+    def _on_unbound_key(self, e):
+        """焦点兜底：未绑定的按键到达说明已有焦点，避免意外穿透。"""
+        return 'break'
+
     def _on_wheel(self, e):
         try:
             self.canvas.yview_scroll(int(-e.delta / 120), 'units')
@@ -1053,6 +1102,11 @@ class ClipHistoryManager:
 
 
 def main():
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, STARTUP_NAME)
+    if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        _log('startup: 检测到已有实例运行，本次启动直接退出')
+        return
+
     root = tk.Tk()
     root.withdraw()
 
@@ -1076,14 +1130,19 @@ def main():
         _clip_store = ClipStore()
         _clip_manager = ClipHistoryManager(root, _clip_store)
         threading.Thread(target=_clipboard_listener, daemon=True).start()
-    except Exception:
+        _log(f'startup: 剪贴板模块就绪 pid={os.getpid()} '
+             f'frozen={getattr(sys, "frozen", False)}')
+    except Exception as e:
+        _log(f'startup: 剪贴板模块失败 {e!r}')
         _clip_store = None
         _clip_manager = None
 
     pynkb.Listener(on_press=on_key_press, on_release=on_key_release,
                    daemon=True).start()
+    _log(f'startup: 键盘监听启动 pid={os.getpid()}')
     setup_tray(root)
     PopupManager(root)
+    _log('startup: 进入主循环')
     root.mainloop()
 
 
